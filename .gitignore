@@ -1,0 +1,4 @@
+/target/
+*.key
+*.state
+/terminal-tailnet-state.bin
