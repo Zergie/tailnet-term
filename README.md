@@ -27,6 +27,19 @@ The scripts install missing Rust and MSVC build tools when run online. MSVC setu
 
 Use `exit` to close the session. Reuse the state file when restarting the server. Each connection gets a fresh PowerShell session, and one client can connect at a time.
 
+## Run a single command
+
+Add a command after the key file to run it without a terminal, as with `ssh host command`:
+
+```powershell
+.\tailnet-term.exe client <server-tailnet-ip> .\client.key hostname
+.\tailnet-term.exe client <server-tailnet-ip> .\client.key 'Get-ChildItem C:\ | Select-Object Name'
+```
+
+The command and its arguments are joined with spaces and run by the server's PowerShell. Quote the whole remote command so the local shell keeps its quotes, pipes and semicolons. The command gets no standard input. Its stdout and stderr arrive separately as UTF-8, without terminal escape sequences or line wrapping. The client exits with the command's exit code: an explicit `exit N`, otherwise the native exit code of a failed last command (or 1), and 0 on success. When the connection fails or ends early, the client exits with 255. Closing the client stops the command.
+
+Use this mode for scripts and agents instead of piping commands into an interactive session. This changes the protocol: update client and server together. Mixed versions fail with a compatibility error.
+
 The server selects a DERP relay automatically. Set `TS_DERP_REGION` to a numeric region ID to override the selection.
 
 The server keeps running when the client restarts or re-logs in to Tailscale, and it reconnects to Tailscale control and the DERP relay after network failures, retrying with a delay of up to 30 seconds. If the client disappears without closing its connection, the server drops the session after about a minute and accepts a new connection.

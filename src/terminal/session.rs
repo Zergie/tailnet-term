@@ -10,17 +10,21 @@ use std::{
 
 use smoltcp::socket::tcp::Socket;
 
-use super::{auth, pty::Shell};
+use super::{auth, exec::Exec, pty::Shell};
 
-// Protocol, version 2:
+// Protocol, version 3:
 //   server -> client: MAGIC, 32-byte nonce
 //   client -> server: 64-byte Ed25519 signature over (context, server IP, nonce)
+//   client -> server: one request frame: SHELL (interactive) or EXEC (UTF-8 command)
 //   server -> client: one status byte (ACCEPTED, REJECTED or SERVER_FAILURE)
-//   after ACCEPTED, client -> server: frames [kind: u8][length: u16 LE][payload]
-//                   server -> client: raw terminal output
+// Frames are [kind: u8][length: u16 LE][payload]. After ACCEPTED:
+//   SHELL: client -> server: DATA, RESIZE and HANGUP frames
+//          server -> client: raw terminal output
+//   EXEC:  client -> server: nothing (closing the connection ends the command)
+//          server -> client: STDOUT and STDERR frames, then one EXIT frame (u32 LE)
 // Frames are parsed only after the signature has been verified.
 
-pub const MAGIC: &[u8; 8] = b"TNETPTY2";
+pub const MAGIC: &[u8; 8] = b"TNETPTY3";
 pub const REJECTED: u8 = 0;
 pub const ACCEPTED: u8 = 1;
 pub const SERVER_FAILURE: u8 = 2;
@@ -28,8 +32,16 @@ pub const SERVER_FAILURE: u8 = 2;
 const FRAME_DATA: u8 = 0;
 const FRAME_RESIZE: u8 = 1;
 const FRAME_HANGUP: u8 = 2;
+const FRAME_SHELL: u8 = 3;
+const FRAME_EXEC: u8 = 4;
+const OUTPUT_STDOUT: u8 = 0;
+const OUTPUT_STDERR: u8 = 1;
+const OUTPUT_EXIT: u8 = 2;
 const FRAME_HEADER_LEN: usize = 3;
 pub const MAX_FRAME_PAYLOAD: usize = 4096;
+/// Longest remote command in UTF-8 bytes. Its Base64 form travels in an environment variable,
+/// which stays well below the Windows limit of 32767 characters.
+pub const MAX_COMMAND_LEN: usize = 8192;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a finished session waits for the peer to close after all output was acknowledged.
@@ -37,7 +49,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound for a finished session, even if the peer stops acknowledging output.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Received but not yet decoded client bytes are capped to keep backpressure on the socket.
-const MAX_INBOUND_BUFFER: usize = 2 * (FRAME_HEADER_LEN + MAX_FRAME_PAYLOAD);
+const MAX_INBOUND_BUFFER: usize = 2 * (FRAME_HEADER_LEN + MAX_COMMAND_LEN);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Frame {
@@ -47,6 +59,10 @@ pub enum Frame {
     Resize { columns: u16, rows: u16 },
     /// The client's input ended; the session should end now.
     Hangup,
+    /// Request: start an interactive shell.
+    Shell,
+    /// Request: run one command non-interactively and report its exit code.
+    Exec(String),
 }
 
 impl Frame {
@@ -59,6 +75,37 @@ impl Frame {
                 output.extend_from_slice(&rows.to_le_bytes());
             }
             Self::Hangup => push_header(output, FRAME_HANGUP, 0),
+            Self::Shell => push_header(output, FRAME_SHELL, 0),
+            Self::Exec(command) => {
+                push_header(output, FRAME_EXEC, command.len());
+                output.extend_from_slice(command.as_bytes());
+            }
+        }
+    }
+}
+
+/// What the server sends in exec mode.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Output {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(u32),
+}
+
+impl Output {
+    pub fn encode(&self, output: &mut Vec<u8>) {
+        let (kind, bytes) = match self {
+            Self::Stdout(bytes) => (OUTPUT_STDOUT, bytes),
+            Self::Stderr(bytes) => (OUTPUT_STDERR, bytes),
+            Self::Exit(code) => {
+                push_header(output, OUTPUT_EXIT, 4);
+                output.extend_from_slice(&code.to_le_bytes());
+                return;
+            }
+        };
+        for chunk in bytes.chunks(MAX_FRAME_PAYLOAD) {
+            push_header(output, kind, chunk.len());
+            output.extend_from_slice(chunk);
         }
     }
 }
@@ -81,6 +128,8 @@ fn push_header(output: &mut Vec<u8>, kind: u8, length: usize) {
 pub enum ProtocolError {
     UnknownFrame(u8),
     BadLength { kind: u8, length: usize },
+    BadCommand,
+    UnexpectedFrame,
 }
 
 impl fmt::Display for ProtocolError {
@@ -90,6 +139,8 @@ impl fmt::Display for ProtocolError {
             Self::BadLength { kind, length } => {
                 write!(f, "invalid length {length} for frame type {kind}")
             }
+            Self::BadCommand => write!(f, "the command is not valid UTF-8"),
+            Self::UnexpectedFrame => write!(f, "frame not allowed in this session state"),
         }
     }
 }
@@ -116,36 +167,82 @@ impl FrameDecoder {
     }
 
     pub fn next_frame(&mut self) -> Result<Option<Frame>, ProtocolError> {
-        let Some(&[kind, low, high]) = self.buffer.get(..FRAME_HEADER_LEN) else {
+        let Some((kind, payload)) = take_frame(&mut self.buffer, |kind, length| match kind {
+            FRAME_DATA => Some(length <= MAX_FRAME_PAYLOAD),
+            FRAME_RESIZE => Some(length == 4),
+            FRAME_HANGUP | FRAME_SHELL => Some(length == 0),
+            FRAME_EXEC => Some(length <= MAX_COMMAND_LEN),
+            _ => None,
+        })?
+        else {
             return Ok(None);
         };
-        let length = usize::from(u16::from_le_bytes([low, high]));
-        let valid = match kind {
-            FRAME_DATA => length <= MAX_FRAME_PAYLOAD,
-            FRAME_RESIZE => length == 4,
-            FRAME_HANGUP => length == 0,
-            _ => return Err(ProtocolError::UnknownFrame(kind)),
-        };
-        if !valid {
-            return Err(ProtocolError::BadLength { kind, length });
-        }
-        if self.buffer.len() < FRAME_HEADER_LEN + length {
-            return Ok(None);
-        }
-        let payload: Vec<u8> = self
-            .buffer
-            .drain(..FRAME_HEADER_LEN + length)
-            .skip(FRAME_HEADER_LEN)
-            .collect();
         Ok(Some(match kind {
             FRAME_DATA => Frame::Data(payload),
             FRAME_RESIZE => Frame::Resize {
                 columns: u16::from_le_bytes([payload[0], payload[1]]),
                 rows: u16::from_le_bytes([payload[2], payload[3]]),
             },
-            _ => Frame::Hangup,
+            FRAME_HANGUP => Frame::Hangup,
+            FRAME_SHELL => Frame::Shell,
+            _ => Frame::Exec(String::from_utf8(payload).map_err(|_| ProtocolError::BadCommand)?),
         }))
     }
+}
+
+/// Incremental decoder for exec-mode server output; input may be split anywhere.
+#[derive(Default)]
+pub struct OutputDecoder {
+    buffer: Vec<u8>,
+}
+
+impl OutputDecoder {
+    pub fn extend(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    pub fn next_output(&mut self) -> Result<Option<Output>, ProtocolError> {
+        let Some((kind, payload)) = take_frame(&mut self.buffer, |kind, length| match kind {
+            OUTPUT_STDOUT | OUTPUT_STDERR => Some(length <= MAX_FRAME_PAYLOAD),
+            OUTPUT_EXIT => Some(length == 4),
+            _ => None,
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match kind {
+            OUTPUT_STDOUT => Output::Stdout(payload),
+            OUTPUT_STDERR => Output::Stderr(payload),
+            _ => Output::Exit(u32::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ])),
+        }))
+    }
+}
+
+/// Removes one complete frame from `buffer`. `valid` returns `None` for an unknown kind, and
+/// otherwise whether the length is allowed for it.
+fn take_frame(
+    buffer: &mut Vec<u8>,
+    valid: impl FnOnce(u8, usize) -> Option<bool>,
+) -> Result<Option<(u8, Vec<u8>)>, ProtocolError> {
+    let Some(&[kind, low, high]) = buffer.get(..FRAME_HEADER_LEN) else {
+        return Ok(None);
+    };
+    let length = usize::from(u16::from_le_bytes([low, high]));
+    match valid(kind, length) {
+        None => return Err(ProtocolError::UnknownFrame(kind)),
+        Some(false) => return Err(ProtocolError::BadLength { kind, length }),
+        Some(true) => {}
+    }
+    if buffer.len() < FRAME_HEADER_LEN + length {
+        return Ok(None);
+    }
+    let payload = buffer
+        .drain(..FRAME_HEADER_LEN + length)
+        .skip(FRAME_HEADER_LEN)
+        .collect();
+    Ok(Some((kind, payload)))
 }
 
 pub struct TerminalSession {
@@ -166,11 +263,17 @@ enum State {
         challenge: auth::Challenge,
         proof: Vec<u8>,
     },
+    /// Authenticated; waiting for the SHELL or EXEC request.
+    AwaitingRequest {
+        sent: Instant,
+    },
     AwaitingShell,
+    AwaitingExec(JoinHandle<Result<Exec, String>>),
     Active {
         shell: Shell,
         exited: Option<Instant>,
     },
+    Executing(Exec),
     Finished {
         since: Instant,
     },
@@ -204,7 +307,7 @@ impl TerminalSession {
     /// session; they never surface as `Err`.
     pub fn poll(&mut self, socket: &mut Socket<'_>) -> Result<bool, Box<dyn Error>> {
         if !socket.is_open() {
-            if matches!(self.state, State::Active { .. }) {
+            if matches!(self.state, State::Active { .. } | State::Executing(_)) {
                 eprintln!("Terminal connection closed");
             }
             // Dropping an active shell here kills its process tree.
@@ -251,7 +354,9 @@ impl TerminalSession {
                     }
                     if proof.len() == auth::SIGNATURE_LEN {
                         if auth::verify(&self.peer_key, self.local_ip, challenge, proof) {
-                            self.state = State::AwaitingShell;
+                            self.state = State::AwaitingRequest {
+                                sent: Instant::now(),
+                            };
                         } else {
                             eprintln!("Client key rejected");
                             self.pending_output.push(REJECTED);
@@ -291,8 +396,50 @@ impl TerminalSession {
                     self.prepared = Some(prepare_shell(self.program.clone()));
                 }
             }
+            State::AwaitingRequest { sent } => {
+                if sent.elapsed() >= AUTH_TIMEOUT || !socket.may_recv() {
+                    eprintln!("Client request timed out or client disconnected");
+                    self.finish(socket, End::Close);
+                } else if let Some(end) = self.poll_request(socket) {
+                    self.finish(socket, end);
+                }
+            }
+            State::AwaitingExec(spawning) => {
+                if !socket.may_send() {
+                    eprintln!("Client disconnected before the command started");
+                    self.finish(socket, End::Close);
+                } else if spawning.is_finished() {
+                    let State::AwaitingExec(spawning) =
+                        std::mem::replace(&mut self.state, State::AwaitingShell)
+                    else {
+                        unreachable!("matched above");
+                    };
+                    match spawning.join() {
+                        Ok(Ok(exec)) => {
+                            self.pending_output.push(ACCEPTED);
+                            self.state = State::Executing(exec);
+                            eprintln!("Client key accepted; running a command");
+                        }
+                        Ok(Err(error)) => {
+                            eprintln!("The command could not be started: {error}");
+                            self.pending_output.push(SERVER_FAILURE);
+                            self.finish(socket, End::Close);
+                        }
+                        Err(_) => {
+                            eprintln!("Command start thread panicked");
+                            self.pending_output.push(SERVER_FAILURE);
+                            self.finish(socket, End::Close);
+                        }
+                    }
+                }
+            }
             State::Active { .. } => {
                 if let Some(end) = self.poll_active(socket) {
+                    self.finish(socket, end);
+                }
+            }
+            State::Executing(_) => {
+                if let Some(end) = self.poll_exec(socket) {
                     self.finish(socket, end);
                 }
             }
@@ -389,6 +536,13 @@ impl TerminalSession {
                         eprintln!("Client input ended");
                         return Some(End::Close);
                     }
+                    Ok(Some(Frame::Shell | Frame::Exec(_))) => {
+                        eprintln!(
+                            "Terminal protocol error: {}",
+                            ProtocolError::UnexpectedFrame
+                        );
+                        return Some(End::Abort);
+                    }
                     Ok(None) => break,
                     Err(error) => {
                         eprintln!("Terminal protocol error: {error}");
@@ -418,6 +572,95 @@ impl TerminalSession {
             }
         }
         None
+    }
+
+    /// Reads the client's SHELL or EXEC request. Returns how to end the session, if it should end.
+    fn poll_request(&mut self, socket: &mut Socket<'_>) -> Option<End> {
+        if let Err(end) = self.receive(socket) {
+            return Some(end);
+        }
+        match self.inbound.next_frame() {
+            Ok(None) => None,
+            Ok(Some(Frame::Shell)) => {
+                self.state = State::AwaitingShell;
+                None
+            }
+            Ok(Some(Frame::Exec(command))) => {
+                let program = self.program.clone();
+                self.state = State::AwaitingExec(thread::spawn(move || {
+                    Exec::spawn(&program, &command).map_err(|error| error.to_string())
+                }));
+                None
+            }
+            Ok(Some(_)) => {
+                eprintln!(
+                    "Terminal protocol error: {}",
+                    ProtocolError::UnexpectedFrame
+                );
+                Some(End::Abort)
+            }
+            Err(error) => {
+                eprintln!("Terminal protocol error: {error}");
+                Some(End::Abort)
+            }
+        }
+    }
+
+    /// Relays a command's output and exit code. The client sends nothing in exec mode; anything
+    /// it does send is discarded so the connection keeps its receive window.
+    fn poll_exec(&mut self, socket: &mut Socket<'_>) -> Option<End> {
+        if !socket.may_send() {
+            eprintln!("Client stopped receiving command output");
+            return Some(End::Close);
+        }
+        while socket.can_recv() {
+            let mut discard = [0; 2048];
+            if let Err(error) = socket.recv_slice(&mut discard) {
+                eprintln!("Terminal receive failed: {error}");
+                return Some(End::Abort);
+            }
+        }
+        if !socket.may_recv() {
+            // The client never half-closes in exec mode: a FIN means it was stopped.
+            eprintln!("Client closed the connection; stopping the command");
+            return Some(End::Close);
+        }
+        let State::Executing(exec) = &mut self.state else {
+            return None;
+        };
+        while self.pending_output.len() < MAX_FRAME_PAYLOAD {
+            match exec.poll() {
+                Ok(Some(output)) => {
+                    output.encode(&mut self.pending_output);
+                    if let Output::Exit(code) = output {
+                        eprintln!("Command exited with code {code}");
+                        return Some(End::Close);
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("Command status check failed: {error}");
+                    return Some(End::Close);
+                }
+            }
+        }
+        None
+    }
+
+    /// Moves received client bytes into the frame decoder, keeping it bounded.
+    fn receive(&mut self, socket: &mut Socket<'_>) -> Result<(), End> {
+        if self.inbound.buffered() < MAX_INBOUND_BUFFER && socket.can_recv() {
+            let mut bytes = [0; 2048];
+            let room = (MAX_INBOUND_BUFFER - self.inbound.buffered()).min(bytes.len());
+            match socket.recv_slice(&mut bytes[..room]) {
+                Ok(count) => self.inbound.extend(&bytes[..count]),
+                Err(error) => {
+                    eprintln!("Terminal receive failed: {error}");
+                    return Err(End::Abort);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Ends the session: drops the shell (killing its process tree) and starts closing the
@@ -483,6 +726,8 @@ mod tests {
                 rows: u16::MAX,
             },
             Frame::Hangup,
+            Frame::Shell,
+            Frame::Exec("Get-Item 'C:\\ä'; exit 3".to_owned()),
         ];
         let bytes = encoded(&frames);
         let mut decoder = FrameDecoder::default();
@@ -548,11 +793,256 @@ mod tests {
     }
 
     #[test]
+    fn decodes_exec_output_split_at_every_byte() {
+        let large: Vec<u8> = (0..=255).cycle().take(MAX_FRAME_PAYLOAD + 7).collect();
+        let mut bytes = Vec::new();
+        for output in [
+            Output::Stdout(b"out\r\n".to_vec()),
+            Output::Stderr(large.clone()),
+            Output::Exit(0xC000_013A),
+        ] {
+            output.encode(&mut bytes);
+        }
+        let mut decoder = OutputDecoder::default();
+        let mut decoded = Vec::new();
+        for byte in bytes {
+            decoder.extend(&[byte]);
+            while let Some(output) = decoder.next_output().unwrap() {
+                decoded.push(output);
+            }
+        }
+        assert_eq!(
+            decoded,
+            [
+                Output::Stdout(b"out\r\n".to_vec()),
+                Output::Stderr(large[..MAX_FRAME_PAYLOAD].to_vec()),
+                Output::Stderr(large[MAX_FRAME_PAYLOAD..].to_vec()),
+                Output::Exit(0xC000_013A),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_or_invalid_commands() {
+        let mut decoder = FrameDecoder::default();
+        let oversized = u16::try_from(MAX_COMMAND_LEN + 1).unwrap().to_le_bytes();
+        decoder.extend(&[FRAME_EXEC, oversized[0], oversized[1]]);
+        assert!(matches!(
+            decoder.next_frame(),
+            Err(ProtocolError::BadLength { .. })
+        ));
+
+        let mut decoder = FrameDecoder::default();
+        decoder.extend(&[FRAME_EXEC, 1, 0, 0xFF]);
+        assert_eq!(decoder.next_frame(), Err(ProtocolError::BadCommand));
+
+        let mut decoder = OutputDecoder::default();
+        decoder.extend(&[OUTPUT_EXIT, 3, 0]);
+        assert!(decoder.next_output().is_err());
+    }
+
+    #[test]
     fn waits_for_complete_frames() {
         let mut decoder = FrameDecoder::default();
         decoder.extend(&[FRAME_DATA, 3, 0, b'a']);
         assert_eq!(decoder.next_frame(), Ok(None));
         decoder.extend(b"bc");
         assert_eq!(decoder.next_frame(), Ok(Some(Frame::Data(b"abc".to_vec()))));
+    }
+}
+
+/// Drives `TerminalSession` over two smoltcp stacks, with a real PowerShell for exec requests.
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+    use crate::tcp_probe::{PacketDevice, interface, server_socket, tcp_socket};
+    use auth::Challenge;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use smoltcp::{
+        iface::{Interface, SocketHandle, SocketSet},
+        time::Instant as TcpTime,
+        wire::IpAddress,
+    };
+
+    const SERVER_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+    const PORT: u16 = 7681;
+
+    struct Loopback {
+        start: Instant,
+        client_device: PacketDevice,
+        server_device: PacketDevice,
+        client: Interface,
+        server: Interface,
+        client_sockets: SocketSet<'static>,
+        server_sockets: SocketSet<'static>,
+        client_handle: SocketHandle,
+        server_handle: SocketHandle,
+        session: TerminalSession,
+        key: Ed25519KeyPair,
+        received: Vec<u8>,
+    }
+
+    impl Loopback {
+        fn new() -> Self {
+            let root = std::env::var_os("SystemRoot").unwrap();
+            let shell =
+                std::path::Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+            let key = Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
+            let public = key.public_key().as_ref().try_into().unwrap();
+            let mut client_device = PacketDevice::default();
+            let mut server_device = PacketDevice::default();
+            let client = interface(&mut client_device, Ipv4Addr::new(100, 64, 0, 1), 24);
+            let server = interface(&mut server_device, SERVER_IP, 24);
+            let mut server_sockets = SocketSet::new(vec![]);
+            let mut listener = server_socket();
+            listener.listen(PORT).unwrap();
+            let server_handle = server_sockets.add(listener);
+            let mut loopback = Self {
+                start: Instant::now(),
+                client_device,
+                server_device,
+                client,
+                server,
+                client_sockets: SocketSet::new(vec![]),
+                server_sockets,
+                client_handle: SocketHandle::default(),
+                server_handle,
+                session: TerminalSession::new(public, shell, SERVER_IP),
+                key,
+                received: Vec::new(),
+            };
+            loopback.connect(49152);
+            loopback
+        }
+
+        fn connect(&mut self, local_port: u16) {
+            let mut connector = tcp_socket();
+            connector
+                .connect(
+                    self.client.context(),
+                    (IpAddress::Ipv4(SERVER_IP), PORT),
+                    local_port,
+                )
+                .unwrap();
+            self.client_sockets = SocketSet::new(vec![]);
+            self.client_handle = self.client_sockets.add(connector);
+            self.received.clear();
+        }
+
+        fn client_socket(&mut self) -> &mut Socket<'static> {
+            self.client_sockets.get_mut::<Socket>(self.client_handle)
+        }
+
+        /// One round of both stacks and the session, re-arming the listener like the server.
+        fn step(&mut self) {
+            let now = TcpTime::from_millis(self.start.elapsed().as_millis() as i64);
+            self.client
+                .poll(now, &mut self.client_device, &mut self.client_sockets);
+            self.server_device
+                .incoming
+                .extend(self.client_device.outgoing.drain(..));
+            self.server
+                .poll(now, &mut self.server_device, &mut self.server_sockets);
+            self.client_device
+                .incoming
+                .extend(self.server_device.outgoing.drain(..));
+            let socket = self.server_sockets.get_mut::<Socket>(self.server_handle);
+            if !socket.is_open() {
+                self.session.reset();
+                socket.listen(PORT).unwrap();
+            }
+            self.session.poll(socket).unwrap();
+            let client = self.client_sockets.get_mut::<Socket>(self.client_handle);
+            while client.can_recv() {
+                let mut buffer = [0; 2048];
+                let count = client.recv_slice(&mut buffer).unwrap();
+                self.received.extend_from_slice(&buffer[..count]);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        /// Steps until `done` holds, failing after 30 s.
+        fn until(&mut self, mut done: impl FnMut(&mut Self) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done(self) {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out: received {:?}, client {}",
+                    self.received.clone(),
+                    self.client_sockets
+                        .get::<Socket>(self.client_handle)
+                        .state()
+                );
+                self.step();
+            }
+        }
+
+        /// Authenticates with `request` and returns the status byte.
+        fn open(&mut self, request: Frame) -> u8 {
+            let challenge_len = MAGIC.len() + 32;
+            self.until(|this| this.received.len() >= challenge_len);
+            assert_eq!(&self.received[..MAGIC.len()], MAGIC);
+            let nonce: Challenge = self.received[MAGIC.len()..challenge_len]
+                .try_into()
+                .unwrap();
+            let mut hello = auth::sign(&self.key, SERVER_IP, &nonce).to_vec();
+            request.encode(&mut hello);
+            self.client_socket().send_slice(&hello).unwrap();
+            self.until(|this| this.received.len() > challenge_len);
+            self.received.drain(..challenge_len);
+            self.received.remove(0)
+        }
+
+        /// Decodes everything received in exec mode, up to and including the exit code.
+        fn outputs(&self) -> (Vec<u8>, Option<u32>) {
+            let mut decoder = OutputDecoder::default();
+            decoder.extend(&self.received);
+            let mut stdout = Vec::new();
+            while let Some(output) = decoder.next_output().unwrap() {
+                match output {
+                    Output::Stdout(bytes) => stdout.extend(bytes),
+                    Output::Stderr(_) => {}
+                    Output::Exit(code) => return (stdout, Some(code)),
+                }
+            }
+            (stdout, None)
+        }
+    }
+
+    #[test]
+    fn runs_commands_back_to_back_and_closes() {
+        let mut loopback = Loopback::new();
+        assert_eq!(loopback.open(Frame::Exec("'one'; exit 4".into())), ACCEPTED);
+        loopback.until(|this| this.outputs().1.is_some() && !this.client_socket().may_recv());
+        assert_eq!(loopback.outputs(), (b"one\r\n".to_vec(), Some(4)));
+        loopback.client_socket().close();
+        loopback.until(|this| !this.client_socket().is_open());
+        loopback.connect(49153);
+        assert_eq!(loopback.open(Frame::Exec("'two'".into())), ACCEPTED);
+        loopback.until(|this| this.outputs().1.is_some());
+        assert_eq!(loopback.outputs(), (b"two\r\n".to_vec(), Some(0)));
+    }
+
+    #[test]
+    fn client_close_stops_a_running_command() {
+        let mut loopback = Loopback::new();
+        assert_eq!(
+            loopback.open(Frame::Exec("'started'; Start-Sleep 60".into())),
+            ACCEPTED
+        );
+        loopback.until(|this| !this.outputs().0.is_empty());
+        let started = Instant::now();
+        loopback.client_socket().close();
+        loopback
+            .until(|this| matches!(this.session.state, State::Finished { .. } | State::Waiting));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn accepts_an_interactive_request() {
+        // Under the test harness the prepared "shell" is this test binary, which exits at once;
+        // only the handshake order is checked here.
+        let mut loopback = Loopback::new();
+        assert_eq!(loopback.open(Frame::Shell), ACCEPTED);
     }
 }

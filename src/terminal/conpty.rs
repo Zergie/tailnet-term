@@ -28,11 +28,12 @@ use windows_sys::Win32::{
         },
         Pipes::CreatePipe,
         Threading::{
-            CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-            InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
-            TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+            INFINITE, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread,
+            STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+            UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
 };
@@ -88,7 +89,7 @@ fn coord(columns: u16, rows: u16) -> COORD {
 pub struct Job(OwnedHandle);
 
 impl Job {
-    fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         // An unnamed job with default security. The handle is owned immediately.
         let handle = unsafe { CreateJobObjectW(null(), null()) };
         if handle.is_null() {
@@ -143,6 +144,19 @@ impl Child {
             WAIT_TIMEOUT => Ok(false),
             _ => Err(io::Error::last_os_error()),
         }
+    }
+
+    /// The exit code, once the process has exited.
+    pub fn exit_code(&self) -> io::Result<Option<u32>> {
+        if !self.exited()? {
+            return Ok(None);
+        }
+        let mut code = 0;
+        // The process handle is owned and stays valid through this call.
+        if unsafe { GetExitCodeProcess(self.0.as_raw_handle(), &mut code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(code))
     }
 }
 
@@ -229,22 +243,30 @@ pub fn open(executable: &Path) -> io::Result<Pty> {
     })
 }
 
+impl Attributes {
+    /// An initialized attribute list with room for one attribute.
+    fn new() -> io::Result<Self> {
+        let mut size = 0;
+        // The first call queries the allocation size. usize storage preserves the required
+        // alignment.
+        unsafe {
+            InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
+        }
+        if size == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buffer = vec![0usize; size.div_ceil(size_of::<usize>())];
+        if unsafe { InitializeProcThreadAttributeList(buffer.as_mut_ptr().cast(), 1, 0, &mut size) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(buffer))
+    }
+}
+
 fn spawn(executable: &Path, console: &Console, job: &Job) -> io::Result<Child> {
-    let mut size = 0;
-    // The first call queries the allocation size. usize storage preserves the required alignment.
-    unsafe {
-        InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
-    }
-    if size == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut buffer = vec![0usize; size.div_ceil(size_of::<usize>())];
-    if unsafe { InitializeProcThreadAttributeList(buffer.as_mut_ptr().cast(), 1, 0, &mut size) }
-        == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let mut attributes = Attributes(buffer);
+    let mut attributes = Attributes::new()?;
     let list = attributes.0.as_mut_ptr().cast();
     // The pseudoconsole attribute takes the HPCON value, not the address of the wrapper.
     if unsafe {
@@ -282,7 +304,7 @@ fn spawn(executable: &Path, console: &Console, job: &Job) -> io::Result<Child> {
         .chain([u16::from(b'"')])
         .chain([0])
         .collect();
-    let environment = shell_environment();
+    let environment = shell_environment(None);
     // The process starts suspended so it is inside the job before it can create children.
     // Win32 borrows all buffers for the duration of this call and returns owned handles.
     if unsafe {
@@ -316,6 +338,120 @@ fn spawn(executable: &Path, console: &Console, job: &Job) -> io::Result<Child> {
         return Err(io::Error::last_os_error());
     }
     Ok(process)
+}
+
+/// A process on plain pipes with a hidden console and no standard input.
+///
+/// Field order is drop order: the job kills the whole process tree first.
+pub struct Piped {
+    pub job: Job,
+    pub child: Child,
+    pub stdout: File,
+    pub stderr: File,
+}
+
+/// Starts `"executable" arguments` inside a new job, with `variable` added to its environment.
+/// Only the three standard handles are inherited, and the Tailscale credentials are removed
+/// from its environment.
+pub fn spawn_piped(
+    executable: &Path,
+    arguments: &str,
+    variable: (&str, &str),
+) -> io::Result<Piped> {
+    let (stdout, stdout_write) = pipe()?;
+    let (stderr, stderr_write) = pipe()?;
+    let stdin = OwnedHandle::from(File::open("NUL")?);
+    let inherited = [
+        stdin.as_raw_handle(),
+        stdout_write.as_raw_handle(),
+        stderr_write.as_raw_handle(),
+    ];
+    for handle in inherited {
+        // The handles are owned above and stay open through this call.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let mut attributes = Attributes::new()?;
+    let list = attributes.0.as_mut_ptr().cast();
+    // The handle list restricts inheritance to the child's standard handles. Win32 keeps a
+    // pointer to `inherited`, which outlives the CreateProcessW call below.
+    if unsafe {
+        UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            inherited.as_ptr().cast(),
+            size_of_val(&inherited),
+            null_mut(),
+            null(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = inherited[0];
+    startup.StartupInfo.hStdOutput = inherited[1];
+    startup.StartupInfo.hStdError = inherited[2];
+    startup.lpAttributeList = list;
+    let path: Vec<u16> = executable.as_os_str().encode_wide().chain([0]).collect();
+    let mut command: Vec<u16> = [u16::from(b'"')]
+        .into_iter()
+        .chain(executable.as_os_str().encode_wide())
+        .chain(OsStr::new("\" ").encode_wide())
+        .chain(OsStr::new(arguments).encode_wide())
+        .chain([0])
+        .collect();
+    let environment = shell_environment(Some(variable));
+    let job = Job::new()?;
+    let mut child = PROCESS_INFORMATION::default();
+    // The process starts suspended so it is inside the job before it can create children. A
+    // hidden console (rather than none) lets PowerShell switch native programs to UTF-8.
+    // Win32 borrows all buffers for the duration of this call and returns owned handles.
+    if unsafe {
+        CreateProcessW(
+            path.as_ptr(),
+            command.as_mut_ptr(),
+            null(),
+            null(),
+            1,
+            EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_SUSPENDED
+                | CREATE_NO_WINDOW,
+            environment.as_ptr().cast(),
+            null(),
+            &startup.StartupInfo,
+            &mut child,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let (process, thread) = unsafe {
+        (
+            Child(OwnedHandle::from_raw_handle(child.hProcess)),
+            OwnedHandle::from_raw_handle(child.hThread),
+        )
+    };
+    // Dropping `process` on an error path terminates the suspended child.
+    if unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), process.0.as_raw_handle()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    // The child holds its own copies; the readers see end of file once every writer exits.
+    drop((stdin, stdout_write, stderr_write));
+    Ok(Piped {
+        job,
+        child: process,
+        stdout: File::from(stdout),
+        stderr: File::from(stderr),
+    })
 }
 
 /// Runs inside the pseudoconsole: starts PowerShell with a cleared Ctrl+C ignore flag and waits
@@ -401,9 +537,10 @@ fn filtered_environment(
     vars
 }
 
-fn shell_environment() -> Vec<u16> {
+fn shell_environment(extra: Option<(&str, &str)>) -> Vec<u16> {
     let mut block = Vec::new();
-    for (name, value) in filtered_environment(std::env::vars_os()) {
+    let extra = extra.map(|(name, value)| (OsString::from(name), OsString::from(value)));
+    for (name, value) in filtered_environment(std::env::vars_os().chain(extra)) {
         block.extend(name.encode_wide());
         block.push(u16::from(b'='));
         block.extend(value.encode_wide());

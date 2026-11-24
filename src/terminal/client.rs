@@ -26,7 +26,75 @@ use super::{
 
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-pub fn run(target: Ipv4Addr, key_file: &Path) -> Result<(), Box<dyn Error>> {
+/// Exit code when the connection ends without the command's exit code (as ssh uses 255).
+pub const CONNECTION_LOST: u32 = 255;
+
+/// Runs `command` on the server and returns its exit code, or opens an interactive session
+/// when `command` is `None` and returns 0.
+pub fn run(
+    target: Ipv4Addr,
+    key_file: &Path,
+    command: Option<String>,
+) -> Result<u32, Box<dyn Error>> {
+    match command {
+        Some(command) => {
+            if command.len() > session::MAX_COMMAND_LEN {
+                return Err(format!(
+                    "the command is longer than {} bytes",
+                    session::MAX_COMMAND_LEN
+                )
+                .into());
+            }
+            let (stream, _) = connect(target, key_file, &Frame::Exec(command))?;
+            execute(stream)
+        }
+        None => interactive(target, key_file).map(|()| 0),
+    }
+}
+
+/// Relays exec-mode output. Standard input is never read and the connection is never
+/// half-closed: the server treats a closed connection as cancellation.
+fn execute(mut stream: TcpStream) -> Result<u32, Box<dyn Error>> {
+    let mut decoder = session::OutputDecoder::default();
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = match stream.read(&mut buffer) {
+            Ok(0) => {
+                eprintln!("Error: connection closed before the command finished");
+                return Ok(CONNECTION_LOST);
+            }
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return Ok(CONNECTION_LOST);
+            }
+        };
+        decoder.extend(&buffer[..count]);
+        while let Some(output) = decoder.next_output()? {
+            match output {
+                session::Output::Stdout(bytes) => {
+                    stdout.write_all(&bytes)?;
+                    stdout.flush()?;
+                }
+                session::Output::Stderr(bytes) => {
+                    stderr.write_all(&bytes)?;
+                    stderr.flush()?;
+                }
+                session::Output::Exit(code) => return Ok(code),
+            }
+        }
+    }
+}
+
+/// Connects, authenticates and sends `request`. Returns the stream once the server accepted.
+fn connect(
+    target: Ipv4Addr,
+    key_file: &Path,
+    request: &Frame,
+) -> Result<(TcpStream, Instant), Box<dyn Error>> {
     if target.octets()[0] != 100 || !(64..=127).contains(&target.octets()[1]) {
         return Err("server must be a Tailnet IPv4 address in 100.64.0.0/10".into());
     }
@@ -48,7 +116,9 @@ pub fn run(target: Ipv4Addr, key_file: &Path) -> Result<(), Box<dyn Error>> {
         return Err("server did not send a compatible terminal challenge".into());
     }
     let nonce = handshake[MAGIC.len()..].try_into()?;
-    stream.write_all(&auth::sign(&key, target, &nonce))?;
+    let mut hello = auth::sign(&key, target, &nonce).to_vec();
+    request.encode(&mut hello);
+    stream.write_all(&hello)?;
     let mut status = [0];
     stream.read_exact(&mut status)?;
     match status[0] {
@@ -65,6 +135,12 @@ pub fn run(target: Ipv4Addr, key_file: &Path) -> Result<(), Box<dyn Error>> {
         );
     }
     stream.set_read_timeout(None)?;
+    Ok((stream, authenticated))
+}
+
+fn interactive(target: Ipv4Addr, key_file: &Path) -> Result<(), Box<dyn Error>> {
+    let timing = std::env::var_os("TS_TERMINAL_TIMING").is_some();
+    let (mut stream, authenticated) = connect(target, key_file, &Frame::Shell)?;
 
     let keyboard = io::stdin().is_terminal();
     let display = io::stdout().is_terminal();

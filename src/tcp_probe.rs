@@ -89,7 +89,7 @@ pub(crate) fn server_socket() -> Socket<'static> {
 }
 
 #[cfg(test)]
-fn tcp_socket() -> Socket<'static> {
+pub(crate) fn tcp_socket() -> Socket<'static> {
     Socket::new(
         SocketBuffer::new(vec![0; 2048]),
         SocketBuffer::new(vec![0; 2048]),
