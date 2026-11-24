@@ -4,7 +4,10 @@ use std::{
     net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpStream},
     path::Path,
     ptr::null,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -228,11 +231,18 @@ fn write_frames(writer: &Mutex<TcpStream>, bytes: &[u8]) -> io::Result<()> {
 
 fn copy_terminal_output(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
     let mut buffer = [0; 8192];
+    let mut filter = OutputFilter::default();
+    let mut filtered = Vec::with_capacity(buffer.len());
     loop {
         match input.read(&mut buffer) {
-            Ok(0) => return Ok(()),
+            Ok(0) => {
+                output.write_all(filter.finish())?;
+                return output.flush();
+            }
             Ok(count) => {
-                output.write_all(&buffer[..count])?;
+                filtered.clear();
+                filter.filter(&buffer[..count], &mut filtered);
+                output.write_all(&filtered)?;
                 output.flush()?;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -241,28 +251,130 @@ fn copy_terminal_output(input: &mut impl Read, output: &mut impl Write) -> io::R
     }
 }
 
+/// The server's pseudoconsole asks its terminal for win32-input-mode. Passed on, the request
+/// switches the local console to report each typed character as a win32 key sequence. When the
+/// local terminal delivers an arrow key as the characters `ESC [ A` (terminals that host the
+/// client through a pseudoconsole do), the server then receives three plain characters and
+/// PowerShell shows `^[[A`. Without it, the console sends standard VT key sequences, which the
+/// server parses.
+const WIN32_INPUT_MODE: &[u8] = b"\x1b[?9001h";
+
+/// Removes `WIN32_INPUT_MODE` from terminal output, including when split across reads.
+#[derive(Default)]
+struct OutputFilter {
+    held: Vec<u8>,
+}
+
+impl OutputFilter {
+    fn filter(&mut self, bytes: &[u8], output: &mut Vec<u8>) {
+        let mut data = std::mem::take(&mut self.held);
+        data.extend_from_slice(bytes);
+        let mut rest = &data[..];
+        while let Some(start) = rest.iter().position(|&byte| byte == 0x1B) {
+            output.extend_from_slice(&rest[..start]);
+            rest = &rest[start..];
+            if rest.starts_with(WIN32_INPUT_MODE) {
+                rest = &rest[WIN32_INPUT_MODE.len()..];
+            } else if WIN32_INPUT_MODE.starts_with(rest) {
+                // Possibly the start of the request: wait for the next read.
+                self.held = rest.to_vec();
+                return;
+            } else {
+                output.push(0x1B);
+                rest = &rest[1..];
+            }
+        }
+        output.extend_from_slice(rest);
+    }
+
+    fn finish(&mut self) -> &[u8] {
+        &self.held
+    }
+}
+
 /// Reads the console directly. Unlike `std::io::stdin`, `ReadConsoleW` without a read-control
 /// structure returns Ctrl+Z (0x1A) as an ordinary character instead of end of input.
 fn send_keyboard_input(writer: &Mutex<TcpStream>) -> io::Result<()> {
-    // The standard input handle belongs to this process's console and stays open.
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    let mut units = [0u16; 512];
-    let mut decoder = Utf16Decoder::default();
-    let mut bytes = Vec::with_capacity(units.len() * 3);
-    // A failed read means the console is gone or unreadable: the real end of input.
-    while let Ok(count) = read_console(handle, &mut units) {
-        if count == 0 {
-            // Woken without input (no line editing or Ctrl+C processing is active).
-            thread::sleep(Duration::from_millis(10));
-            continue;
+    let (keys, received) = mpsc::channel();
+    thread::spawn(move || {
+        // The standard input handle belongs to this process's console and stays open.
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut units = [0u16; 512];
+        let mut decoder = Utf16Decoder::default();
+        // A failed read means the console is gone or unreadable: the real end of input.
+        while let Ok(count) = read_console(handle, &mut units) {
+            if count == 0 {
+                // Woken without input (no line editing or Ctrl+C processing is active).
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            let mut bytes = Vec::with_capacity(count * 3);
+            decoder.decode(&units[..count], &mut bytes);
+            if !bytes.is_empty() && keys.send(bytes).is_err() {
+                break;
+            }
         }
-        bytes.clear();
-        decoder.decode(&units[..count], &mut bytes);
-        if !bytes.is_empty() {
-            send_data(writer, &bytes)?;
+    });
+    forward_keys(&received, ESCAPE_WAIT, |bytes| send_data(writer, bytes))?;
+    send_frame(writer, &Frame::Hangup)
+}
+
+/// How long an unfinished escape sequence waits for the rest of its bytes.
+const ESCAPE_WAIT: Duration = Duration::from_millis(50);
+
+/// Forwards keyboard bytes, keeping each escape sequence in one write.
+///
+/// A console may return an arrow key's ESC and `[A` from separate reads. The server's
+/// pseudoconsole reads an ESC that ends a write as the Escape key, so the remote shell would see
+/// `[A` as text. An unfinished sequence waits up to `wait` for its remaining bytes; a lone Escape
+/// key press is sent once that time has passed.
+fn forward_keys(
+    keys: &Receiver<Vec<u8>>,
+    wait: Duration,
+    mut send: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut pending = Vec::new();
+    loop {
+        let next = if pending.is_empty() {
+            keys.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            keys.recv_timeout(wait)
+        };
+        let held = match next {
+            Ok(bytes) => {
+                pending.extend_from_slice(&bytes);
+                unfinished_escape(&pending)
+            }
+            Err(RecvTimeoutError::Timeout) => 0,
+            Err(RecvTimeoutError::Disconnected) => {
+                if !pending.is_empty() {
+                    send(&pending)?;
+                }
+                return Ok(());
+            }
+        };
+        if pending.len() > held {
+            send(&pending[..pending.len() - held])?;
+            pending.drain(..pending.len() - held);
         }
     }
-    send_frame(writer, &Frame::Hangup)
+}
+
+/// Length of an escape sequence that `bytes` ends with but does not complete.
+fn unfinished_escape(bytes: &[u8]) -> usize {
+    let Some(start) = bytes.iter().rposition(|&byte| byte == 0x1B) else {
+        return 0;
+    };
+    let tail = &bytes[start..];
+    let unfinished = match tail {
+        [_] => true,
+        // SS3 (ESC O A) takes one more byte.
+        [_, b'O'] => true,
+        // CSI is unfinished while only parameter and intermediate bytes follow.
+        [_, b'[', rest @ ..] => rest.iter().all(|byte| (0x20..0x40).contains(byte)),
+        _ => false,
+    };
+    if unfinished { tail.len() } else { 0 }
 }
 
 fn read_console(handle: HANDLE, units: &mut [u16]) -> io::Result<usize> {
@@ -432,6 +544,73 @@ mod tests {
         output.clear();
         decoder.decode(&[0xDC00, u16::from(b'b')], &mut output);
         assert_eq!(output, "\u{FFFD}b".as_bytes());
+    }
+
+    #[test]
+    fn removes_win32_input_mode_request() {
+        let stream = b"\x1b[?9001h\x1b[?1004h\x1b[2JPS> \x1b[?9001h\x1b[A";
+        let expected = b"\x1b[?1004h\x1b[2JPS> \x1b[A";
+        for cut in 0..=stream.len() {
+            let mut filter = OutputFilter::default();
+            let mut output = Vec::new();
+            filter.filter(&stream[..cut], &mut output);
+            filter.filter(&stream[cut..], &mut output);
+            output.extend_from_slice(filter.finish());
+            assert_eq!(output, expected, "split at {cut}");
+        }
+        let mut filter = OutputFilter::default();
+        let mut output = Vec::new();
+        filter.filter(b"x\x1b[?90", &mut output);
+        assert_eq!(output, b"x");
+        assert_eq!(filter.finish(), b"\x1b[?90");
+    }
+
+    #[test]
+    fn finds_unfinished_escape_sequences() {
+        assert_eq!(unfinished_escape(b"abc"), 0);
+        assert_eq!(unfinished_escape(b"a\x1b"), 1);
+        assert_eq!(unfinished_escape(b"\x1b["), 2);
+        assert_eq!(unfinished_escape(b"x\x1b[1;5"), 5);
+        assert_eq!(unfinished_escape(b"\x1bO"), 2);
+        assert_eq!(unfinished_escape(b"\x1b[A"), 0);
+        assert_eq!(unfinished_escape(b"\x1bOA"), 0);
+        assert_eq!(unfinished_escape(b"\x1b[38;72;0;1;288;1_"), 0);
+        assert_eq!(unfinished_escape(b"\x1ba"), 0);
+        assert_eq!(unfinished_escape(b"\x1b[A\x1b[3"), 3);
+    }
+
+    #[test]
+    fn keeps_split_escape_sequences_together() {
+        let (keys, received) = mpsc::channel();
+        for chunk in [&b"ab\x1b"[..], b"[", b"Acd"] {
+            keys.send(chunk.to_vec()).unwrap();
+        }
+        drop(keys);
+        let mut sent = Vec::new();
+        forward_keys(&received, Duration::from_secs(5), |bytes| {
+            sent.push(bytes.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sent, [b"ab".to_vec(), b"\x1b[Acd".to_vec()]);
+    }
+
+    #[test]
+    fn sends_lone_escape_after_waiting() {
+        let (keys, received) = mpsc::channel();
+        keys.send(b"\x1b".to_vec()).unwrap();
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            keys.send(b"x".to_vec()).unwrap();
+        });
+        let mut sent = Vec::new();
+        forward_keys(&received, Duration::from_millis(20), |bytes| {
+            sent.push(bytes.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        sender.join().unwrap();
+        assert_eq!(sent, [b"\x1b".to_vec(), b"x".to_vec()]);
     }
 
     #[test]

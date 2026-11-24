@@ -101,6 +101,14 @@ pub fn probe(executable: &Path) -> Result<(), Box<dyn Error>> {
     )?;
     wait_for(&shell, b"tailnet-pty-ok")?;
     println!("PASS: PowerShell command chain returned its result");
+    send(&shell, b"Write-Output ('history-' + 'ok')\r")?;
+    wait_for(&shell, b"history-ok")?;
+    // Drop the rest of that command's output so only the recalled command can match.
+    thread::sleep(Duration::from_millis(500));
+    while let Ok(Some(_)) = shell.output() {}
+    send(&shell, b"\x1b[A\r")?;
+    wait_for(&shell, b"history-ok")?;
+    println!("PASS: the Up arrow recalled the previous command");
     send(
         &shell,
         b"Write-Output ('interrupt-'+'armed'); Start-Sleep -Seconds 60\r",
