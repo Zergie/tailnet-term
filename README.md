@@ -1,5 +1,3 @@
-# tailnet-term
-
 <img src="./assets/readme/hero.svg" width="100%" alt="Connection diagram showing a client with Tailscale connecting through a DERP relay to a Windows server with embedded Tailscale">
 
 Open an interactive Windows shell over Tailscale, or run a single PowerShell command and get its output and exit code. The client uses an existing Tailscale installation. The server embeds its own Tailnet connection.
