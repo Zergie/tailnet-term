@@ -76,3 +76,7 @@ Developer probe commands are not part of the regular build. Build them with `car
 - `pty-check <SHELL>` runs a shell with the selected console backend and checks interactive input, output and process handling.
 
 See [repository conventions and engineering priorities](AGENTS.md).
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
