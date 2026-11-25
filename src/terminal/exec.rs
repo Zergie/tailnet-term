@@ -22,9 +22,11 @@ const SCRIPT_VARIABLE: &str = "TAILNET_TERM_SCRIPT";
 /// Fixed PowerShell arguments that run the script from `SCRIPT_VARIABLE`. `-EncodedCommand` is
 /// avoided because Windows PowerShell then writes errors as CLIXML; passing the script in the
 /// environment also avoids command line quoting.
+/// Out-Default finishes formatting buffered objects before the bootstrap exits.
 const BOOTSTRAP: &str = "-NoLogo -NoProfile -NonInteractive -Command \"\
     $s = $env:TAILNET_TERM_SCRIPT; Remove-Item Env:TAILNET_TERM_SCRIPT; \
-    . ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))))\"";
+    $script = [ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))); \
+    if (!$?) { exit 1 }; $tailnetTermExitCode = 1; . $script | Out-Default; exit $tailnetTermExitCode\"";
 
 /// How long to wait for the output pipes to close after the command exited. Background
 /// processes that inherited the pipes would otherwise keep the session open.
@@ -138,7 +140,7 @@ fn wrap_command(command: &str) -> String {
          [Console]::OutputEncoding = $OutputEncoding = [Text.UTF8Encoding]::new($false)\n\
          $global:LASTEXITCODE = 0\n\
          {command}\n\
-         if ($?) {{ exit 0 }} elseif ($LASTEXITCODE) {{ exit $LASTEXITCODE }} else {{ exit 1 }}\n"
+         $tailnetTermExitCode = if ($?) {{ 0 }} elseif ($LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}\n"
     )
 }
 
@@ -178,6 +180,15 @@ mod tests {
                 Some(Output::Exit(code)) => return (stdout, stderr, code),
                 None => thread::sleep(Duration::from_millis(5)),
             }
+        }
+    }
+
+    #[test]
+    fn flushes_formatted_command_output_before_exit() {
+        for shell in shells() {
+            let (stdout, stderr, code) = run_in(&shell, "Get-Location");
+            assert_eq!(code, 0, "{shell:?}: {stderr:?}");
+            assert!(String::from_utf8(stdout).unwrap().contains("Path"), "{shell:?}");
         }
     }
 

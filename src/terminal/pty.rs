@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::Path,
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     thread,
@@ -9,11 +9,35 @@ use std::{
 #[cfg(feature = "diagnostics")]
 use std::time::Duration;
 
-use super::conpty::{self, Child, Console, Job};
+use super::conpty::{self, Child, Job, Pty};
+use super::session::Frame;
+
+enum Console {
+    ConPty(conpty::Console),
+    #[cfg(feature = "classic-pty")]
+    Classic,
+}
+
+fn with_console<T>(pty: Pty<T>, wrap: fn(T) -> Console) -> Pty<Console> {
+    let Pty {
+        job,
+        child,
+        console,
+        output,
+        input,
+    } = pty;
+    Pty {
+        job,
+        child,
+        console: wrap(console),
+        output,
+        input,
+    }
+}
 
 /// Field order is drop order: the job kills the process tree before the pseudoconsole closes.
 pub struct Shell {
-    input: SyncSender<Vec<u8>>,
+    input: SyncSender<Frame>,
     output: Receiver<Vec<u8>>,
     _job: Job,
     child: Child,
@@ -23,24 +47,37 @@ pub struct Shell {
 impl Shell {
     pub fn spawn(executable: &Path) -> Result<Self, Box<dyn Error>> {
         if !executable.is_absolute() || !executable.is_file() {
-            return Err("the PowerShell executable must be an existing absolute path".into());
+            return Err("the shell executable must be an existing absolute path".into());
         }
-        let conpty::Pty {
+        let Pty {
             job,
             child,
             console,
             output: mut reader,
             input: mut writer,
-        } = conpty::open(executable)?;
-        let (input, input_rx) = mpsc::sync_channel::<Vec<u8>>(8);
+        } = open_console(executable)?;
+        #[cfg(feature = "classic-pty")]
+        let classic = matches!(console, Console::Classic);
+        let (input, input_rx) = mpsc::sync_channel::<Frame>(8);
         let (output_tx, output) = mpsc::sync_channel(8);
         thread::spawn(move || {
             // Bytes, including 0x03, go to the pseudoconsole unchanged. Conhost turns 0x03 into
             // CTRL_C_EVENT while the foreground program has processed input enabled and delivers
             // it as a key otherwise (for example to PSReadLine or full-screen programs).
-            while let Ok(bytes) = input_rx.recv() {
+            while let Ok(frame) = input_rx.recv() {
+                #[cfg(feature = "classic-pty")]
+                if classic {
+                    let mut message = Vec::new();
+                    frame.encode(&mut message);
+                    if let Err(error) = writer.write_all(&message) {
+                        eprintln!("Terminal input: {error}");
+                        break;
+                    }
+                    continue;
+                }
+                let Frame::Data(bytes) = frame else { continue };
                 if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
-                    eprintln!("ConPTY input: {error}");
+                    eprintln!("Terminal input: {error}");
                     break;
                 }
             }
@@ -67,9 +104,10 @@ impl Shell {
     }
 
     pub fn input(&self, bytes: Vec<u8>) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-        match self.input.try_send(bytes) {
+        match self.input.try_send(Frame::Data(bytes)) {
             Ok(()) => Ok(None),
-            Err(TrySendError::Full(bytes)) => Ok(Some(bytes)),
+            Err(TrySendError::Full(Frame::Data(bytes))) => Ok(Some(bytes)),
+            Err(TrySendError::Full(_)) => unreachable!("a data frame was sent"),
             Err(TrySendError::Disconnected(_)) => Err("PowerShell input closed".into()),
         }
     }
@@ -87,13 +125,39 @@ impl Shell {
     }
 
     pub fn resize(&self, columns: u16, rows: u16) -> Result<(), Box<dyn Error>> {
-        Ok(self.terminal.resize(columns, rows)?)
+        match &self.terminal {
+            Console::ConPty(console) => console.resize(columns, rows)?,
+            #[cfg(feature = "classic-pty")]
+            Console::Classic => self.input.try_send(Frame::Resize { columns, rows })?,
+        }
+        Ok(())
+    }
+}
+
+fn open_console(executable: &Path) -> io::Result<Pty<Console>> {
+    #[cfg(feature = "classic-pty")]
+    if std::env::var_os("TAILNET_TERM_FORCE_CLASSIC_PTY").as_deref() == Some("1".as_ref()) {
+        return conpty::spawn_console_helper(executable).map(|pty| with_console(pty, |()| Console::Classic));
+    }
+    match conpty::open(executable) {
+        Ok(pty) => Ok(with_console(pty, Console::ConPty)),
+        #[cfg(feature = "classic-pty")]
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            conpty::spawn_console_helper(executable).map(|pty| with_console(pty, |()| Console::Classic))
+        }
+        Err(error) => Err(error),
     }
 }
 
 #[cfg(feature = "diagnostics")]
 pub fn probe(executable: &Path) -> Result<(), Box<dyn Error>> {
     let shell = Shell::spawn(executable)?;
+    #[cfg(feature = "classic-pty")]
+    if matches!(&shell.terminal, Console::Classic) && executable.file_name().is_some_and(|name| {
+        name.to_string_lossy().eq_ignore_ascii_case("cmd.exe")
+    }) {
+        return probe_cmd(shell);
+    }
     wait_for(&shell, b">")?;
     send(
         &shell,
@@ -109,6 +173,12 @@ pub fn probe(executable: &Path) -> Result<(), Box<dyn Error>> {
     send(&shell, b"\x1b[A\r")?;
     wait_for(&shell, b"history-ok")?;
     println!("PASS: the Up arrow recalled the previous command");
+    #[cfg(feature = "classic-pty")]
+    if matches!(&shell.terminal, Console::Classic) {
+        send(&shell, "Write-Outp\t ('tab-' + 'äöü')\r".as_bytes())?;
+        wait_for(&shell, "tab-äöü".as_bytes())?;
+        println!("PASS: PowerShell completed a command with Tab and preserved Unicode");
+    }
     send(
         &shell,
         b"Write-Output ('interrupt-'+'armed'); Start-Sleep -Seconds 60\r",
@@ -119,7 +189,7 @@ pub fn probe(executable: &Path) -> Result<(), Box<dyn Error>> {
     wait_for(&shell, b">")?;
     send(&shell, b"Write-Output ('interrupt-'+'ok')\r")?;
     wait_for(&shell, b"interrupt-ok")?;
-    println!("PASS: ConPTY executed a PowerShell command chain and accepted Ctrl+C");
+    println!("PASS: the terminal executed a PowerShell command chain and accepted Ctrl+C");
     send(
         &shell,
         b"Write-Output ('native-'+'armed'); ping.exe -t -w 1000 127.0.0.1\r",
@@ -135,7 +205,7 @@ pub fn probe(executable: &Path) -> Result<(), Box<dyn Error>> {
     thread::sleep(Duration::from_millis(350));
     send(&shell, b"Write-Output ('idle-'+'ok')\r")?;
     wait_for(&shell, b"idle-ok")?;
-    println!("PASS: Ctrl+C at the prompt left the shell usable");
+    println!("PASS: the terminal cleared the pending input line");
     shell.resize(132, 43)?;
     thread::sleep(Duration::from_millis(200));
     send(
@@ -143,7 +213,7 @@ pub fn probe(executable: &Path) -> Result<(), Box<dyn Error>> {
         b"Write-Output ('size-' + $Host.UI.RawUI.WindowSize.Width + 'x' + $Host.UI.RawUI.WindowSize.Height)\r",
     )?;
     wait_for(&shell, b"size-132x43")?;
-    println!("PASS: ConPTY resize reached PowerShell");
+    println!("PASS: terminal resize reached PowerShell");
     send(
         &shell,
         b"$p = Start-Process -PassThru -WindowStyle Hidden ping.exe '-t 127.0.0.1'; Write-Output ('detached-pid-' + $p.Id + '-e' + 'nd')\r",
@@ -159,6 +229,49 @@ pub fn probe(executable: &Path) -> Result<(), Box<dyn Error>> {
         thread::sleep(Duration::from_millis(100));
     }
     println!("PASS: session teardown killed a detached child process");
+    Ok(())
+}
+
+#[cfg(all(feature = "diagnostics", feature = "classic-pty"))]
+fn probe_cmd(shell: Shell) -> Result<(), Box<dyn Error>> {
+    wait_for(&shell, b">")?;
+    send(&shell, b"echo classic-cmd-%CMDEXTVERSION%\r")?;
+    wait_for(&shell, b"classic-cmd-2")?;
+    send(&shell, b"\x1b[A\r")?;
+    wait_for(&shell, b"classic-cmd-2")?;
+    println!("PASS: cmd.exe executed a command and recalled it with the Up arrow");
+    send(&shell, "echo %CMDEXTVERSION%-äöü\r".as_bytes())?;
+    wait_for(&shell, "2-äöü".as_bytes())?;
+    println!("PASS: cmd.exe preserved Unicode input and output");
+    let system = std::env::var("SystemRoot")?;
+    let completion = format!("dir /b {system}\\System32\\findst\t\r");
+    send(&shell, completion.as_bytes())?;
+    wait_for(&shell, b"findstr.exe")?;
+    println!("PASS: cmd.exe completed a file name with Tab");
+    send(&shell, b"ping.exe -t 127.0.0.1\r")?;
+    wait_for(&shell, b"TTL=")?;
+    send(&shell, b"\x03")?;
+    std::thread::sleep(Duration::from_millis(250));
+    send(&shell, b"echo interrupted-%CMDEXTVERSION%\r")?;
+    wait_for(&shell, b"interrupted-2")?;
+    println!("PASS: Ctrl+C interrupted a native cmd.exe program");
+    shell.resize(132, 43)?;
+    send(&shell, b"for /L %i in (1,1,300) do @echo scroll-%i\r")?;
+    let output = wait_for(&shell, b"scroll-300")?;
+    if !output.windows(b"scroll-100".len()).any(|window| window == b"scroll-100") {
+        return Err("cmd.exe lost intermediate scrollback".into());
+    }
+    println!("PASS: cmd.exe streamed rapid multi-line output after resize");
+    send(&shell, b"exit\r")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !shell.child.exited()? {
+        if std::time::Instant::now() >= deadline {
+            return Err("cmd.exe did not exit".into());
+        }
+        while let Ok(Some(_)) = shell.output() {}
+        thread::sleep(Duration::from_millis(20));
+    }
+    println!("PASS: cmd.exe exited cleanly");
     Ok(())
 }
 
@@ -226,7 +339,7 @@ fn wait_for(shell: &Shell, expected: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         thread::sleep(Duration::from_millis(20));
     }
     Err(format!(
-        "ConPTY did not return {:?}; received {:?}",
+        "Terminal did not return {:?}; received {:?}",
         String::from_utf8_lossy(expected),
         String::from_utf8_lossy(&output)
     )

@@ -13,19 +13,17 @@ use std::{
 
 use windows_sys::Win32::{
     Foundation::{
-        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+        HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
         WAIT_TIMEOUT,
     },
     System::{
-        Console::{
-            COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
-            SetConsoleCtrlHandler,
-        },
+        Console::{COORD, HPCON, SetConsoleCtrlHandler},
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             SetInformationJobObject, TerminateJobObject,
         },
+        LibraryLoader::{GetModuleHandleW, GetProcAddress},
         Pipes::CreatePipe,
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
@@ -53,12 +51,52 @@ const SECRET_ENVIRONMENT: &[&str] = &[
     "TAILSCALE_OAUTH_CLIENT_SECRET",
 ];
 
-pub struct Console(HPCON);
+type CreateConsole = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
+type ResizeConsole = unsafe extern "system" fn(HPCON, COORD) -> i32;
+type CloseConsole = unsafe extern "system" fn(HPCON);
+
+struct ConsoleApi {
+    create: CreateConsole,
+    resize: ResizeConsole,
+    close: CloseConsole,
+}
+
+impl ConsoleApi {
+    fn load() -> io::Result<Self> {
+        // Kernel32 is loaded for the lifetime of the process.
+        let kernel = unsafe { GetModuleHandleW(windows_sys::w!("kernel32.dll")) };
+        if kernel.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let unavailable = || {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ConPTY is unavailable. Use the legacy-support build for interactive sessions on this server.",
+            )
+        };
+        // Each pointer is converted to the corresponding Windows API signature.
+        unsafe {
+            let create = GetProcAddress(kernel, c"CreatePseudoConsole".as_ptr().cast())
+                .ok_or_else(unavailable)?;
+            let resize = GetProcAddress(kernel, c"ResizePseudoConsole".as_ptr().cast())
+                .ok_or_else(unavailable)?;
+            let close = GetProcAddress(kernel, c"ClosePseudoConsole".as_ptr().cast())
+                .ok_or_else(unavailable)?;
+            Ok(Self {
+                create: std::mem::transmute::<_, CreateConsole>(create),
+                resize: std::mem::transmute::<_, ResizeConsole>(resize),
+                close: std::mem::transmute::<_, CloseConsole>(close),
+            })
+        }
+    }
+}
+
+pub struct Console(HPCON, ConsoleApi);
 
 impl Console {
     pub fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
         // The pseudoconsole handle stays valid until this wrapper is dropped.
-        let result = unsafe { ResizePseudoConsole(self.0, coord(columns, rows)) };
+        let result = unsafe { (self.1.resize)(self.0, coord(columns, rows)) };
         if result < 0 {
             return Err(io::Error::other(format!(
                 "ResizePseudoConsole returned 0x{result:08x}"
@@ -72,7 +110,7 @@ impl Drop for Console {
     fn drop(&mut self) {
         // The output worker drains the pipe while this closes the host console.
         unsafe {
-            ClosePseudoConsole(self.0);
+            (self.1.close)(self.0);
         }
     }
 }
@@ -89,7 +127,7 @@ fn coord(columns: u16, rows: u16) -> COORD {
 pub struct Job(OwnedHandle);
 
 impl Job {
-    pub(crate) fn new() -> io::Result<Self> {
+    fn new() -> io::Result<Self> {
         // An unnamed job with default security. The handle is owned immediately.
         let handle = unsafe { CreateJobObjectW(null(), null()) };
         if handle.is_null() {
@@ -190,15 +228,16 @@ fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
 ///
 /// Field order is drop order: the job kills the whole process tree first, then the
 /// pseudoconsole is closed while the output worker still drains its pipe.
-pub struct Pty {
+pub struct Pty<T = Console> {
     pub job: Job,
     pub child: Child,
-    pub console: Console,
+    pub console: T,
     pub output: File,
     pub input: File,
 }
 
 pub fn open(executable: &Path) -> io::Result<Pty> {
+    let api = ConsoleApi::load()?;
     let timing = std::env::var_os("TS_TERMINAL_TIMING").is_some();
     let started = std::time::Instant::now();
     let (input_read, input_write) = pipe()?;
@@ -208,7 +247,7 @@ pub fn open(executable: &Path) -> io::Result<Pty> {
     // resized when the client reports its console size. Zero flags avoid requiring a cursor
     // position reply from the client.
     let result = unsafe {
-        CreatePseudoConsole(
+        (api.create)(
             coord(DEFAULT_SIZE.0, DEFAULT_SIZE.1),
             input_read.as_raw_handle(),
             output_write.as_raw_handle(),
@@ -221,7 +260,7 @@ pub fn open(executable: &Path) -> io::Result<Pty> {
             "CreatePseudoConsole returned 0x{result:08x}"
         )));
     }
-    let console = Console(console);
+    let console = Console(console, api);
     let console_ready = std::time::Instant::now();
     drop(input_read);
     drop(output_write);
@@ -350,6 +389,27 @@ pub struct Piped {
     pub stderr: File,
 }
 
+#[cfg(feature = "classic-pty")]
+pub(crate) fn spawn_console_helper(executable: &Path) -> io::Result<Pty<()>> {
+    let current = std::env::current_exe()?;
+    let mut arguments = OsString::from("classic-console-child \"");
+    arguments.push(executable);
+    arguments.push("\"");
+    let (input, writer) = pipe()?;
+    let Piped { job, child, stdout, stderr } =
+        spawn_with_pipes(&current, &arguments, None, input, true)?;
+    std::thread::spawn(move || {
+        let _ = io::copy(&mut &stderr, &mut io::stderr());
+    });
+    Ok(Pty {
+        job,
+        child,
+        console: (),
+        output: stdout,
+        input: File::from(writer),
+    })
+}
+
 /// Starts `"executable" arguments` inside a new job, with `variable` added to its environment.
 /// Only the three standard handles are inherited, and the Tailscale credentials are removed
 /// from its environment.
@@ -358,9 +418,19 @@ pub fn spawn_piped(
     arguments: &str,
     variable: (&str, &str),
 ) -> io::Result<Piped> {
+    let stdin = OwnedHandle::from(File::open("NUL")?);
+    spawn_with_pipes(executable, OsStr::new(arguments), Some(variable), stdin, false)
+}
+
+fn spawn_with_pipes(
+    executable: &Path,
+    arguments: &OsStr,
+    variable: Option<(&str, &str)>,
+    stdin: OwnedHandle,
+    new_console: bool,
+) -> io::Result<Piped> {
     let (stdout, stdout_write) = pipe()?;
     let (stderr, stderr_write) = pipe()?;
-    let stdin = OwnedHandle::from(File::open("NUL")?);
     let inherited = [
         stdin.as_raw_handle(),
         stdout_write.as_raw_handle(),
@@ -396,16 +466,24 @@ pub fn spawn_piped(
     startup.StartupInfo.hStdInput = inherited[0];
     startup.StartupInfo.hStdOutput = inherited[1];
     startup.StartupInfo.hStdError = inherited[2];
+    let console_flags = if new_console {
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, STARTF_USESHOWWINDOW};
+        startup.StartupInfo.dwFlags |= STARTF_USESHOWWINDOW;
+        startup.StartupInfo.wShowWindow = 0; // SW_HIDE
+        CREATE_NEW_CONSOLE
+    } else {
+        CREATE_NO_WINDOW
+    };
     startup.lpAttributeList = list;
     let path: Vec<u16> = executable.as_os_str().encode_wide().chain([0]).collect();
     let mut command: Vec<u16> = [u16::from(b'"')]
         .into_iter()
         .chain(executable.as_os_str().encode_wide())
         .chain(OsStr::new("\" ").encode_wide())
-        .chain(OsStr::new(arguments).encode_wide())
+        .chain(arguments.encode_wide())
         .chain([0])
         .collect();
-    let environment = shell_environment(Some(variable));
+    let environment = shell_environment(variable);
     let job = Job::new()?;
     let mut child = PROCESS_INFORMATION::default();
     // The process starts suspended so it is inside the job before it can create children. A
@@ -421,7 +499,7 @@ pub fn spawn_piped(
             EXTENDED_STARTUPINFO_PRESENT
                 | CREATE_UNICODE_ENVIRONMENT
                 | CREATE_SUSPENDED
-                | CREATE_NO_WINDOW,
+                | console_flags,
             environment.as_ptr().cast(),
             null(),
             &startup.StartupInfo,

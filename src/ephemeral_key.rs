@@ -16,21 +16,32 @@ use windows_sys::Win32::Networking::WinHttp::{
 };
 use windows_sys::core::w;
 
-pub fn create(mode: &str, tags: Vec<String>) -> Result<(), Box<dyn Error>> {
-    if !matches!(mode, "oauth" | "api") {
-        return Err("expected 'oauth' or 'api'. Run tailnet-term.exe ephemeral-key --help.".into());
-    }
+pub fn create(tags: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let api_key = credential("TAILSCALE_API_KEY");
+    let client_id = credential("TAILSCALE_OAUTH_CLIENT_ID");
+    let client_secret = credential("TAILSCALE_OAUTH_CLIENT_SECRET");
+    let oauth = match (api_key.is_some(), client_id, client_secret) {
+        (true, None, None) => None,
+        (true, _, _) => {
+            return Err("set either TAILSCALE_API_KEY or the OAuth credentials, not both".into());
+        }
+        (false, Some(id), Some(secret)) => Some((id, secret)),
+        (false, None, None) => {
+            return Err("set TAILSCALE_API_KEY or both TAILSCALE_OAUTH_CLIENT_ID and TAILSCALE_OAUTH_CLIENT_SECRET".into());
+        }
+        (false, _, _) => {
+            return Err("OAuth requires both TAILSCALE_OAUTH_CLIENT_ID and TAILSCALE_OAUTH_CLIENT_SECRET".into());
+        }
+    };
     for tag in &tags {
         if !tag.starts_with("tag:") || tag.len() <= 4 {
             return Err("tags must have the form tag:NAME".into());
         }
     }
-    let token = if mode == "oauth" {
+    let token = if let Some((id, secret)) = oauth {
         if tags.is_empty() {
             return Err("OAuth requires at least one tag allowed by the OAuth client".into());
         }
-        let id = credential("TAILSCALE_OAUTH_CLIENT_ID")?;
-        let secret = credential("TAILSCALE_OAUTH_CLIENT_SECRET")?;
         let body = format!(
             "grant_type=client_credentials&client_id={}&client_secret={}",
             form_value(&id),
@@ -48,7 +59,7 @@ pub fn create(mode: &str, tags: Vec<String>) -> Result<(), Box<dyn Error>> {
             .ok_or("Tailscale returned no OAuth access token")?
             .to_owned()
     } else {
-        credential("TAILSCALE_API_KEY")?
+        api_key.expect("validated API credentials")
     };
     if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err("the Tailscale API token contains invalid characters".into());
@@ -74,11 +85,10 @@ pub fn create(mode: &str, tags: Vec<String>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn credential(name: &str) -> Result<String, Box<dyn Error>> {
+fn credential(name: &str) -> Option<String> {
     env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("set {name} before running ephemeral-key").into())
 }
 
 fn form_value(value: &str) -> String {

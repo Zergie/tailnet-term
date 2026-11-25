@@ -3,8 +3,8 @@
 Builds tailnet-term and publishes it as a GitHub release.
 
 .DESCRIPTION
-Sets the version in Cargo.toml and Cargo.lock, runs the tests, builds the regular and the
-UPX-packed executable, and writes SHA256SUMS.txt. It then commits "Release vX.Y.Z", creates an
+Sets the version in Cargo.toml and Cargo.lock, runs the tests, builds both variants with UPX,
+and writes SHA256SUMS.txt. It then commits "Release vX.Y.Z", creates an
 annotated tag, pushes the branch and the tag, and creates the GitHub release with the assets.
 
 The working tree must be clean, the current branch must be main and match origin/main, and the
@@ -105,7 +105,9 @@ $($changes -join "`n")
 
 ## Download
 
-``tailnet-term-$Version-windows-x64.exe`` is a single executable for 64-bit Windows; no installer needed. ``tailnet-term-$Version-windows-x64-packed.exe`` is the same program compressed with UPX. Verify the download against ``SHA256SUMS.txt``:
+``tailnet-term-$Version-windows-x64.exe`` uses ConPTY for interactive sessions. The ``legacy-support`` variant also supports Windows Server 2016 through the classic Windows console backend. Both downloads are standalone executables compressed with UPX.
+
+Verify the download against ``SHA256SUMS.txt``:
 
 ``````powershell
 (Get-FileHash .\tailnet-term-$Version-windows-x64.exe -Algorithm SHA256).Hash
@@ -129,19 +131,17 @@ Built locally with ``Publish-TailnetTermRelease.ps1`` (``cargo build --release -
     if ($LASTEXITCODE -ne 0) { throw 'The tests failed.' }
 
     Write-Host 'Building release executables.'
-    & (Join-Path $PSScriptRoot 'Build-PackedTailnetTerm.ps1') -Upx:$Upx | Out-Host
+    $executables = & (Join-Path $PSScriptRoot 'Build-TailnetTerm.ps1') -Upx:$Upx
     $metadata = Invoke-Native cargo metadata --no-deps --format-version=1 --locked | ConvertFrom-Json
-    $built = Join-Path $metadata.target_directory 'release'
 
     $staging = Join-Path $metadata.target_directory "release-$tag"
     if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
     New-Item -ItemType Directory -Path $staging | Out-Null
-    $assets = @(
-        Copy-Item -LiteralPath (Join-Path $built 'tailnet-term.exe') `
-            -Destination (Join-Path $staging "tailnet-term-$Version-windows-x64.exe") -PassThru
-        Copy-Item -LiteralPath (Join-Path $built 'tailnet-term-packed.exe') `
-            -Destination (Join-Path $staging "tailnet-term-$Version-windows-x64-packed.exe") -PassThru
-    )
+    $assets = foreach ($executable in $executables) {
+        $suffix = $executable.Name.Substring('tailnet-term'.Length)
+        Copy-Item -LiteralPath $executable.FullName `
+            -Destination (Join-Path $staging "tailnet-term-$Version-windows-x64$suffix") -PassThru
+    }
     $sums = Join-Path $staging 'SHA256SUMS.txt'
     $lines = foreach ($asset in $assets) {
         "$((Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()) *$($asset.Name)"

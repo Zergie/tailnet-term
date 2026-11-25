@@ -90,23 +90,24 @@ Example (PowerShell):
   $ip = .\\tailnet-term.exe ip";
 
 const EPHEMERAL_KEY_HELP: &str = "\
-Usage: tailnet-term.exe ephemeral-key <oauth|api> [TAG...]
+Usage: tailnet-term.exe ephemeral-key [TAG...]
 
 Creates a single-use ephemeral Tailscale auth key, valid for 24 hours.
 The key is printed to stdout. Device approval still follows tailnet policy.
 
-  oauth  Uses TAILSCALE_OAUTH_CLIENT_ID and TAILSCALE_OAUTH_CLIENT_SECRET.
-         Requires the auth_keys scope and at least one allowed tag.
-  api    Uses TAILSCALE_API_KEY. Tags are optional.
+Configure exactly one authentication method through environment variables.
+  OAuth    Set TAILSCALE_OAUTH_CLIENT_ID and TAILSCALE_OAUTH_CLIENT_SECRET.
+           Requires the auth_keys scope and at least one allowed tag.
+  API key  Set TAILSCALE_API_KEY. Tags are optional.
 
 Examples (PowerShell):
-  $env:TS_AUTH_KEY = .\\tailnet-term.exe ephemeral-key oauth tag:ephemeral
-  $env:TS_AUTH_KEY = .\\tailnet-term.exe ephemeral-key api";
+  $env:TS_AUTH_KEY = .\\tailnet-term.exe ephemeral-key tag:ephemeral
+  $env:TS_AUTH_KEY = .\\tailnet-term.exe ephemeral-key";
 
 fn command_help(command: &str) -> Option<(&'static str, std::ops::RangeInclusive<usize>)> {
     match command {
         "keygen" => Some((KEYGEN_HELP, 1..=1)),
-        "ephemeral-key" => Some((EPHEMERAL_KEY_HELP, 1..=usize::MAX)),
+        "ephemeral-key" => Some((EPHEMERAL_KEY_HELP, 0..=usize::MAX)),
         "server" => Some((SERVER_HELP, 3..=4)),
         "client" => Some((CLIENT_HELP, 2..=usize::MAX)),
         "ip" => Some((IP_HELP, 0..=0)),
@@ -164,16 +165,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     match command.as_deref() {
+        #[cfg(feature = "classic-pty")]
+        Some("classic-console-child") => Ok(terminal::classic::run(
+            args.next().ok_or("missing shell executable")?.as_ref(),
+        )?),
         Some("console-child") => Ok(terminal::conpty::supervise_console(
             args.next()
                 .ok_or("missing console interrupt handle")?
                 .parse()?,
             args.next().ok_or("missing PowerShell executable")?.as_ref(),
         )?),
-        Some("ephemeral-key") => {
-            let mode = args.next().expect("validated argument count");
-            ephemeral_key::create(&mode, args.collect())
-        }
+        Some("ephemeral-key") => ephemeral_key::create(args.collect()),
         Some("keygen") => terminal::auth::keygen(
             args.next()
                 .ok_or("keygen requires a private key path")?

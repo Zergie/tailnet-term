@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="330" viewBox="0 0 1200 330"
+     role="img" aria-labelledby="title description">
+  <title id="title">tailnet-term</title>
+  <desc id="description">A Tailscale client connects through a DERP relay to a Windows server with embedded Tailscale.</desc>
+
+  <rect width="1200" height="330" rx="24" fill="#111c23"/>
+
+  <g font-family="Consolas, Menlo, monospace">
+    <path d="M58 56l14 12-14 12m24 0h19" fill="none" stroke="#79e2bc" stroke-width="5"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="122" y="88" fill="#f0f7f5" font-size="60" font-weight="bold">tailnet-term</text>
+    <text x="60" y="143" fill="#bacdd0" font-size="36" font-family="Segoe UI, Arial, sans-serif">Windows terminal over Tailscale</text>
+  </g>
+
+  <path d="M84 209H1116" stroke="#79e2bc" stroke-width="3"/>
+  <g fill="#79e2bc">
+    <circle cx="84" cy="209" r="9"/>
+    <circle cx="600" cy="209" r="9"/>
+    <circle cx="1116" cy="209" r="9"/>
+  </g>
+
+  <g font-family="Segoe UI, Arial, sans-serif" font-size="36" font-weight="bold" fill="#f0f7f5">
+    <text x="60" y="265">Client</text>
+    <text x="600" y="265" text-anchor="middle">DERP relay</text>
+    <text x="1140" y="265" text-anchor="end">Windows server</text>
+  </g>
+  <g font-family="Segoe UI, Arial, sans-serif" font-size="30" fill="#bacdd0">
+    <text x="60" y="303">Existing Tailscale</text>
+    <text x="1140" y="303" text-anchor="end">Embedded Tailscale</text>
+  </g>
+</svg>
